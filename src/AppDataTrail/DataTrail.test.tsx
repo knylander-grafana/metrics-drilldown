@@ -1,6 +1,6 @@
-import { dateTime, LoadingState } from '@grafana/data';
+import { dateTime, LoadingState, urlUtil } from '@grafana/data';
 import { locationService, setDataSourceSrv, setRunRequest } from '@grafana/runtime';
-import { sceneGraph } from '@grafana/scenes';
+import { sceneGraph, sceneUtils } from '@grafana/scenes';
 import { of } from 'rxjs';
 
 import { MetricsVariable, VAR_METRICS_VARIABLE } from 'MetricsReducer/metrics-variables/MetricsVariable';
@@ -146,6 +146,191 @@ describe('DataTrail', () => {
       const filterVar = getFilterVar(trail);
       filterVar.setState({ filters: [{ key: 'app', operator: '=~', value: 'start=4,end=2' }] });
       expect(filterVar.getValue()).toBe(`app=~"start\=4,end\=2"`);
+    });
+  });
+});
+
+describe('DataTrail - URL serialization of KG overrides', () => {
+  let trail: DataTrail;
+
+  beforeAll(() => {
+    setDataSourceSrv(
+      new MockDataSourceSrv({
+        prom: { name: 'Prometheus', type: DataSourceType.Prometheus, uid: 'ds' },
+      })
+    );
+  });
+
+  beforeEach(() => {
+    trail = new DataTrail({});
+  });
+
+  describe('getUrlState', () => {
+    it('emits metricType as an array of type-metric pairs', () => {
+      trail.setState({
+        metric: 'my_recording_rule',
+        sourceMetrics: [{ metricName: 'my_recording_rule', labels: [], metricType: 'counter' }],
+      });
+
+      const urlState = trail.getUrlState();
+
+      expect(urlState.metricType).toEqual(['counter-my_recording_rule']);
+    });
+
+    it('emits metricType for all source metrics with overrides, not just the active one', () => {
+      trail.setState({
+        metric: 'metric_a',
+        sourceMetrics: [
+          { metricName: 'metric_a', labels: [], metricType: 'counter' },
+          { metricName: 'metric_b', labels: [], metricType: 'gauge' },
+          { metricName: 'metric_c', labels: [] },
+        ],
+      });
+
+      const urlState = trail.getUrlState();
+
+      expect(urlState.metricType).toEqual(['counter-metric_a', 'gauge-metric_b']);
+    });
+
+    it('returns empty array for metricType when no entries have metricType', () => {
+      trail.setState({
+        metric: 'my_metric',
+        sourceMetrics: [{ metricName: 'my_metric', labels: [] }],
+      });
+
+      const urlState = trail.getUrlState();
+
+      expect(urlState.metricType).toEqual([]);
+    });
+  });
+
+  describe('updateFromUrl', () => {
+    it('parses a single metricType and creates sourceMetrics override', () => {
+      trail.updateFromUrl({ metric: 'my_rule', metricType: 'counter-my_rule' });
+
+      expect(trail.state.sourceMetrics).toEqual([
+        { metricName: 'my_rule', labels: [], metricType: 'counter' },
+      ]);
+    });
+
+    it('parses multiple metricType entries', () => {
+      trail.updateFromUrl({
+        metric: 'metric_a',
+        metricType: ['counter-metric_a', 'gauge-metric_b'],
+      });
+
+      expect(trail.state.sourceMetrics).toEqual([
+        { metricName: 'metric_a', labels: [], metricType: 'counter' },
+        { metricName: 'metric_b', labels: [], metricType: 'gauge' },
+      ]);
+    });
+
+    it('creates sourceMetrics with both metricType and customRateInterval', () => {
+      trail.updateFromUrl({
+        metric: 'my_rule',
+        metricType: 'counter-my_rule',
+        customRateInterval: '5m',
+      });
+
+      expect(trail.state.sourceMetrics?.[0]?.metricType).toBe('counter');
+      expect(trail.state.sourceMetrics?.[0]?.customRateInterval).toBe('5m');
+    });
+
+    it('merges metricType with customFunction on different metrics', () => {
+      trail.updateFromUrl({
+        metric: 'metric_a',
+        metricType: 'counter-metric_a',
+        customFunction: 'max_over_time-metric_b',
+      });
+
+      expect(trail.state.sourceMetrics).toEqual([
+        { metricName: 'metric_a', labels: [], metricType: 'counter' },
+        { metricName: 'metric_b', labels: [], customFunction: 'max_over_time' },
+      ]);
+    });
+
+    it('ignores invalid metricType values', () => {
+      trail.updateFromUrl({ metric: 'my_rule', metricType: 'invalid-my_rule' });
+
+      expect(trail.state.sourceMetrics).toEqual([
+        { metricName: 'my_rule', labels: [] },
+      ]);
+    });
+
+    it('skips URL values in embedded mode', () => {
+      trail.setState({ embedded: true });
+
+      trail.updateFromUrl({ metric: 'my_rule', metricType: 'counter-my_rule' });
+
+      expect(trail.state.metric).toBeUndefined();
+    });
+  });
+
+  describe('URL round-trip through Scenes sync layer', () => {
+    it('preserves multiple metricType params from a raw query string', () => {
+      activateFullSceneTree(trail);
+
+      sceneUtils.syncStateFromSearchParams(
+        trail,
+        new URLSearchParams('metric=metric_a&metricType=counter-metric_a&metricType=gauge-metric_b')
+      );
+
+      expect(trail.state.sourceMetrics).toEqual([
+        { metricName: 'metric_a', labels: [], metricType: 'counter' },
+        { metricName: 'metric_b', labels: [], metricType: 'gauge' },
+      ]);
+    });
+
+    it('preserves multiple customFunction params from a raw query string', () => {
+      activateFullSceneTree(trail);
+
+      sceneUtils.syncStateFromSearchParams(
+        trail,
+        new URLSearchParams('metric=metric_a&customFunction=max_over_time-metric_a&customFunction=min_over_time-metric_b')
+      );
+
+      expect(trail.state.sourceMetrics).toEqual([
+        { metricName: 'metric_a', labels: [], customFunction: 'max_over_time' },
+        { metricName: 'metric_b', labels: [], customFunction: 'min_over_time' },
+      ]);
+    });
+
+    it('preserves mixed metricType and customFunction params', () => {
+      activateFullSceneTree(trail);
+
+      sceneUtils.syncStateFromSearchParams(
+        trail,
+        new URLSearchParams(
+          'metric=metric_a&metricType=counter-metric_a&metricType=histogram-metric_b&customFunction=max_over_time-metric_a'
+        )
+      );
+
+      expect(trail.state.sourceMetrics).toEqual([
+        { metricName: 'metric_a', labels: [], metricType: 'counter', customFunction: 'max_over_time' },
+        { metricName: 'metric_b', labels: [], metricType: 'histogram' },
+      ]);
+    });
+
+    it('round-trips getUrlState through urlUtil.renderUrl without losing entries', () => {
+      trail.setState({
+        metric: 'metric_a',
+        sourceMetrics: [
+          { metricName: 'metric_a', labels: [], metricType: 'counter' },
+          { metricName: 'metric_b', labels: [], metricType: 'gauge' },
+        ],
+      });
+
+      const urlState = trail.getUrlState();
+      const rendered = urlUtil.renderUrl('', urlState);
+
+      const trail2 = new DataTrail({});
+      activateFullSceneTree(trail2);
+      sceneUtils.syncStateFromSearchParams(trail2, new URLSearchParams(rendered));
+
+      expect(trail2.state.sourceMetrics).toEqual([
+        { metricName: 'metric_a', labels: [], metricType: 'counter' },
+        { metricName: 'metric_b', labels: [], metricType: 'gauge' },
+      ]);
     });
   });
 });
